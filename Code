@@ -1,1 +1,1004 @@
 
+import SwiftUI
+import Charts
+import Combine
+
+// MARK: - APP ENTRY POINT
+@main
+struct MyApp: App {
+    var body: some Scene {
+        WindowGroup { MainAppView() }
+    }
+}
+
+// MARK: - 0. THEME MANAGER & BACKGROUNDS
+enum AppTheme: String, CaseIterable {
+    case classicWhite = "Classic White"
+    case muzliDark = "Muzli Dark"
+}
+
+class ThemeManager: ObservableObject {
+    @Published var currentTheme: AppTheme {
+        didSet { UserDefaults.standard.set(currentTheme.rawValue, forKey: "appTheme") }
+    }
+    init() {
+        let savedTheme = UserDefaults.standard.string(forKey: "appTheme") ?? AppTheme.classicWhite.rawValue
+        self.currentTheme = AppTheme(rawValue: savedTheme) ?? .classicWhite
+    }
+    var colorScheme: ColorScheme { return currentTheme == .muzliDark ? .dark : .light }
+}
+
+struct ThemeBackgroundView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    var body: some View {
+        if themeManager.currentTheme == .classicWhite {
+            Color(UIColor.systemGroupedBackground).ignoresSafeArea()
+        } else {
+            Color(red: 0.12, green: 0.16, blue: 0.20).ignoresSafeArea()
+        }
+    }
+}
+
+struct ThemeGlass: ViewModifier {
+    @EnvironmentObject var themeManager: ThemeManager
+    var cornerRadius: CGFloat = 16
+    func body(content: Content) -> some View {
+        if themeManager.currentTheme == .classicWhite {
+            content.background(Color.white).cornerRadius(cornerRadius)
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).stroke(Color.black, lineWidth: 2))
+        } else {
+            content.background(.ultraThinMaterial).background(Color.black.opacity(0.25)).cornerRadius(cornerRadius)
+                .overlay(RoundedRectangle(cornerRadius: cornerRadius).stroke(Color.white.opacity(0.1), lineWidth: 1))
+                .shadow(color: Color.black.opacity(0.2), radius: 15, x: 0, y: 10)
+        }
+    }
+}
+extension View { func themeGlassStyle(cornerRadius: CGFloat = 16) -> some View { self.modifier(ThemeGlass(cornerRadius: cornerRadius)) } }
+
+// MARK: - 1. DATA MODELS
+struct UserProfile: Codable {
+    var name: String = "My Profile"
+    var email: String = ""
+    var isEmailVerified: Bool = false
+    var lastCloudSync: Date? = nil
+
+    var weightKg: Double?
+    var baselineWeightKg: Double?
+    var heightCm: Double?
+    var age: Int?
+    var isMale: Bool = true
+    var rawBodyFatPercentage: Double?
+    var isSouthAsian: Bool = true
+    var targetBodyFatPercentage: Double = 14.0
+    var activityMultiplier: Double = 1.2
+    var weeklyLossRate: Double = 0.0075
+
+    var correctedBodyFatPercentage: Double? {
+        guard let rawBF = rawBodyFatPercentage else { return nil }
+        return isSouthAsian ? (rawBF + 4.3) : rawBF
+    }
+    var fatFreeMassKg: Double? {
+        guard let w = weightKg, let bf = correctedBodyFatPercentage else { return nil }
+        return w * (1.0 - (bf / 100.0))
+    }
+    var basalMetabolicRate: Double {
+        let w = weightKg ?? 66.5
+        let h = heightCm ?? 170.0
+        let a = age ?? 23
+        if let ffm = fatFreeMassKg { return 370.0 + (21.6 * ffm) }
+        else {
+            let wF = 10.0 * w
+            let hF = 6.25 * h
+            let aF = 5.0 * Double(a)
+            return isMale ? (wF + hF - aF + 5.0) : (wF + hF - aF - 161.0)
+        }
+    }
+    var baseDailyTargetCalories: Double {
+        let deficit = ((weightKg ?? 66.5) * weeklyLossRate * 7700.0) / 7.0
+        let adaptation = max(0.0, (baselineWeightKg ?? 0) - (weightKg ?? 0)) * 121.0
+        let target = (basalMetabolicRate * activityMultiplier) - deficit - adaptation
+        return max(target, basalMetabolicRate * 1.1)
+    }
+}
+
+struct CategoryItem: Identifiable, Hashable, Codable {
+    var id = UUID()
+    var name: String
+    var emoji: String
+}
+
+struct MealLog: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var date: Date
+    var categoryItem: CategoryItem // Fixed logic flaw: now supports custom categories natively
+    var customName: String?
+    var calories: Double
+    var weightGrams: Double?
+    var cuisineType: String?
+    var proteinGrams: Double?
+    var carbsGrams: Double?
+    var fatGrams: Double?
+    var fiberGrams: Double?
+    var isSavedTemplate: Bool?
+}
+
+struct WorkoutLog: Identifiable, Equatable, Codable {
+    let id = UUID()
+    var date: Date
+    var workoutType: String
+    var caloriesBurned: Double
+}
+
+struct DailyEntry: Identifiable {
+    let id = UUID()
+    var date: Date
+    var isWorkout: Bool
+    var title: String
+    var subtitle: String?
+    var calories: Double
+    var emoji: String
+}
+
+struct AppNotification: Identifiable, Codable {
+    let id = UUID()
+    var icon: String
+    var colorR: Double
+    var colorG: Double
+    var colorB: Double
+    var title: String
+    var text: String
+    var date: Date
+}
+
+// MARK: - 2. HEALTH MANAGER (Logic Layer)
+class HealthManager: ObservableObject {
+    @Published var isAuthorized = false
+    @Published var isMissingVitalData = false
+    @Published var profile = UserProfile()
+    @Published var workoutLogs: [WorkoutLog] = []
+    @Published var notifications: [AppNotification] = []
+
+    @Published var customCategories: [CategoryItem] = [
+        CategoryItem(name: "Breakfast", emoji: "🍞"),
+        CategoryItem(name: "Lunch", emoji: "🥗"),
+        CategoryItem(name: "Dinner", emoji: "🥩"),
+        CategoryItem(name: "Snack", emoji: "🍪"),
+        CategoryItem(name: "Supplements", emoji: "🥤")
+    ]
+
+    func requestAuthorization() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            self.isAuthorized = true
+            self.fetchHealthData()
+        }
+    }
+
+    func fetchHealthData() {
+        self.workoutLogs = [
+            WorkoutLog(date: Date(), workoutType: "Outdoor Run", caloriesBurned: 450.0)
+        ]
+        if self.profile.weightKg == nil || self.profile.heightCm == nil {
+            withAnimation(.spring()) { self.isMissingVitalData = true }
+        }
+    }
+
+    func generateLocalWeeklyReport(from allLogs: [MealLog]) {
+        let calendar = Calendar.current
+        let today = Date()
+        guard let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: today)),
+              let endOfWeek = calendar.date(byAdding: .day, value: 7, to: startOfWeek) else { return }
+
+        let weeklyLogs = allLogs.filter { $0.date >= startOfWeek && $0.date < endOfWeek && ($0.isSavedTemplate == false || $0.isSavedTemplate == nil) }
+
+        let totalCals = weeklyLogs.reduce(0) { $0 + $1.calories }
+        let targetCals = profile.baseDailyTargetCalories * 7
+        let difference = targetCals - totalCals
+        let status = difference < 0 ? "a surplus of \(Int(abs(difference))) kcal" : "a healthy deficit of \(Int(abs(difference))) kcal"
+
+        var categoryCounts: [String: Int] = [:]
+        for log in weeklyLogs { categoryCounts[log.categoryItem.name, default: 0] += 1 }
+        let topCategory = categoryCounts.max(by: { $0.value < $1.value })?.key ?? "None"
+
+        let reportText = """
+        Your weekly check-in is here! Over the past 7 days, you consumed \(Int(totalCals)) kcal out of your \(Int(targetCals)) kcal target, placing you in \(status).
+
+        Your most frequently logged meal time was \(topCategory). To optimize your results next week, ensure you are tracking your exact protein intake and water consumption. Keep up the great consistency!
+        """
+
+        let newNotif = AppNotification(icon: "chart.bar.doc.horizontal", colorR: 0.0, colorG: 0.8, colorB: 0.6, title: "Weekly Data Report", text: reportText, date: Date())
+        DispatchQueue.main.async {
+            withAnimation { self.notifications.insert(newNotif, at: 0) }
+        }
+    }
+
+    func fetchMealEstimate(name: String, weight: Double, cuisine: String) async -> Double {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        return weight * 2.4
+    }
+
+    func validateMacros(protein: Double, carbs: Double, fiber: Double, fat: Double) async -> Double {
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        return (protein * 4.0) + (max(0, carbs - fiber) * 4.0) + (fat * 9.0)
+    }
+}
+
+// MARK: - 3. APP WRAPPER
+struct MainAppView: View {
+    @StateObject private var themeManager = ThemeManager()
+    @StateObject private var healthManager = HealthManager()
+    @State private var isMenuOpen = false
+
+    var body: some View {
+        GeometryReader { geo in
+            let menuWidth = min(geo.size.width * 0.75, 320)
+            ZStack(alignment: .leading) {
+                ThemeBackgroundView()
+
+                DashboardView(healthManager: healthManager, isMenuOpen: $isMenuOpen)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .disabled(isMenuOpen)
+
+                if isMenuOpen {
+                    Color.black.opacity(0.3).ignoresSafeArea()
+                        .onTapGesture { withAnimation(.spring()) { isMenuOpen = false } }
+                }
+
+                SideMenuView(isMenuOpen: $isMenuOpen, healthManager: healthManager)
+                    .frame(width: menuWidth)
+                    .ignoresSafeArea(edges: .bottom)
+                    .offset(x: isMenuOpen ? 0 : -menuWidth)
+            }
+        }
+        .environmentObject(themeManager)
+        .preferredColorScheme(themeManager.colorScheme)
+    }
+}
+
+// MARK: - 4. SIDE MENU & CLOUD PROFILE
+struct SideMenuView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    @Binding var isMenuOpen: Bool
+    @ObservedObject var healthManager: HealthManager
+
+    @State private var showingManualEntry = false
+    @State private var showingCloudProfile = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button(action: { showingCloudProfile = true }) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Image(systemName: "person.crop.circle.fill").font(.system(size: 60)).foregroundColor(.primary)
+                    Text(healthManager.profile.name.isEmpty ? "My Profile" : healthManager.profile.name).font(.title2).bold().foregroundColor(.primary)
+
+                    if healthManager.profile.isEmailVerified {
+                        HStack { Image(systemName: "checkmark.shield.fill").foregroundColor(.green); Text("Verified & Secured").font(.caption).bold().foregroundColor(.green) }
+                    } else {
+                        HStack { Image(systemName: "exclamationmark.shield.fill").foregroundColor(.orange); Text("Unverified Account").font(.caption).bold().foregroundColor(.orange) }
+                    }
+                }
+                .padding(.top, 60).padding(.bottom, 30).padding(.horizontal, 20).frame(maxWidth: .infinity, alignment: .leading)
+            }.buttonStyle(PlainButtonStyle())
+
+            List {
+                Section(header: Text("Appearance").foregroundColor(.secondary)) {
+                    Picker("Theme", selection: $themeManager.currentTheme) {
+                        ForEach(AppTheme.allCases, id: \.self) { theme in Text(theme.rawValue).tag(theme) }
+                    }.pickerStyle(.segmented).listRowBackground(Color.primary.opacity(0.05))
+                }
+                Section(header: Text("Data & Calibration").foregroundColor(.secondary)) {
+                    Button(action: { showingCloudProfile = true }) {
+                        HStack { Image(systemName: "icloud.fill").foregroundColor(.blue); Text("Cloud Sync & Profile").foregroundColor(.primary); Spacer() }
+                    }.listRowBackground(Color.primary.opacity(0.05))
+
+                    Button(action: { showingManualEntry = true }) {
+                        HStack { Image(systemName: "square.and.pencil").foregroundColor(.blue); Text("Manual Data Entry").foregroundColor(.primary); Spacer(); if healthManager.isMissingVitalData { Image(systemName: "exclamationmark.circle.fill").foregroundColor(.orange) } }
+                    }.listRowBackground(Color.primary.opacity(0.05))
+                }
+            }.listStyle(.insetGrouped).scrollContentBackground(.hidden)
+            Spacer()
+        }
+        .background(.ultraThinMaterial).background(themeManager.currentTheme == .muzliDark ? Color.black.opacity(0.4) : Color.white)
+        .overlay(Rectangle().frame(width: 1, alignment: .trailing).foregroundColor(Color.primary.opacity(0.1)), alignment: .trailing)
+        .sheet(isPresented: $showingManualEntry) { ManualDataEntryView(healthManager: healthManager) }
+        .sheet(isPresented: $showingCloudProfile) { CloudProfileView(healthManager: healthManager) }
+    }
+}
+
+struct CloudProfileView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    @ObservedObject var healthManager: HealthManager
+
+    @State private var inputName: String = ""
+    @State private var inputEmail: String = ""
+    @State private var isVerifying = false
+    @State private var isBackingUp = false
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                Form {
+                    Section(header: Text("Account Details")) {
+                        TextField("Name", text: $inputName).listRowBackground(Color.primary.opacity(0.05))
+                        TextField("Email Address", text: $inputEmail).keyboardType(.emailAddress).autocapitalization(.none).listRowBackground(Color.primary.opacity(0.05)).disabled(healthManager.profile.isEmailVerified)
+
+                        if !healthManager.profile.isEmailVerified {
+                            Button(action: {
+                                isVerifying = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                    healthManager.profile.name = inputName
+                                    healthManager.profile.email = inputEmail
+                                    healthManager.profile.isEmailVerified = true
+                                    isVerifying = false
+                                }
+                            }) {
+                                HStack { Spacer(); if isVerifying { ProgressView() } else { Text("Verify Email").bold().foregroundColor(.blue) }; Spacer() }
+                            }.disabled(inputEmail.isEmpty).listRowBackground(Color.primary.opacity(0.05))
+                        }
+                    }
+
+                    if healthManager.profile.isEmailVerified {
+                        Section(header: Text("Cloud Storage"), footer: Text("Back up your meal logs securely.")) {
+                            if let lastSync = healthManager.profile.lastCloudSync {
+                                HStack { Text("Last Sync").foregroundColor(.secondary); Spacer(); Text(lastSync, style: .relative).foregroundColor(.primary) }.listRowBackground(Color.primary.opacity(0.05))
+                            }
+                            Button(action: {
+                                isBackingUp = true
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                    healthManager.profile.lastCloudSync = Date()
+                                    isBackingUp = false
+                                }
+                            }) {
+                                HStack {
+                                    Image(systemName: "externaldrive.badge.icloud").foregroundColor(.green)
+                                    Text(isBackingUp ? "Uploading Data..." : "Backup Now").bold().foregroundColor(.green)
+                                    Spacer()
+                                    if isBackingUp { ProgressView() }
+                                }
+                            }.listRowBackground(Color.primary.opacity(0.05))
+                        }
+                    }
+                }.scrollContentBackground(.hidden)
+            }
+            .navigationTitle("Profile & Sync").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        if !inputName.isEmpty { healthManager.profile.name = inputName }
+                        dismiss()
+                    }.foregroundColor(.primary).bold()
+                }
+            }
+            .onAppear {
+                inputName = healthManager.profile.name == "My Profile" ? "" : healthManager.profile.name
+                inputEmail = healthManager.profile.email
+            }
+        }
+    }
+}
+
+struct ManualDataEntryView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    @ObservedObject var healthManager: HealthManager
+
+    @State private var weightInput: String = ""
+    @State private var heightInput: String = ""
+    @State private var bodyFatInput: String = ""
+    @State private var baselineWeightInput: String = ""
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                Form {
+                    Section(header: Text("Core Metrics")) {
+                        HStack { Text("Current Weight (kg)").foregroundColor(.primary); Spacer(); TextField("e.g. 75", text: $weightInput).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.listRowBackground(Color.primary.opacity(0.05))
+                        HStack { Text("Height (cm)").foregroundColor(.primary); Spacer(); TextField("e.g. 175", text: $heightInput).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.listRowBackground(Color.primary.opacity(0.05))
+                    }
+                    Section(header: Text("Advanced Calibration")) {
+                        HStack { Text("Body Fat (%)").foregroundColor(.primary); Spacer(); TextField("e.g. 18.5", text: $bodyFatInput).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.listRowBackground(Color.primary.opacity(0.05))
+                    }
+                }.scrollContentBackground(.hidden)
+            }
+            .navigationTitle("Update Profile").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() }.foregroundColor(.primary) }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") {
+                        if let w = Double(weightInput) { healthManager.profile.weightKg = w }
+                        if let h = Double(heightInput) { healthManager.profile.heightCm = h }
+                        if let bf = Double(bodyFatInput) { healthManager.profile.rawBodyFatPercentage = bf }
+                        healthManager.isMissingVitalData = false; dismiss()
+                    }.bold().foregroundColor(.blue)
+                }
+            }
+            .onAppear {
+                if let w = healthManager.profile.weightKg { weightInput = String(w) }
+                if let h = healthManager.profile.heightCm { heightInput = String(h) }
+                if let bf = healthManager.profile.rawBodyFatPercentage { bodyFatInput = String(bf) }
+            }
+        }
+    }
+}
+
+// MARK: - 5. MAIN DASHBOARD
+struct DashboardView: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    @ObservedObject var healthManager: HealthManager
+    @Binding var isMenuOpen: Bool
+
+    @State private var mealLogs: [MealLog] = []
+    @State private var savedMealTemplates: [MealLog] = []
+
+    @State private var showingAddMeal = false
+    @State private var selectedViewingMonth: Date = Date()
+    @State private var showingMonthPicker = false
+    @State private var showingNotifications = false
+    @State private var showingCalendarOverview = false
+    @State private var showingIntakeDetails = false
+
+    var validMonthLogs: [MealLog] {
+        let calendar = Calendar.current
+        return mealLogs.filter { log in calendar.isDate(log.date, equalTo: selectedViewingMonth, toGranularity: .month) && (log.isSavedTemplate == false || log.isSavedTemplate == nil) }
+    }
+
+    var validMonthWorkouts: [WorkoutLog] {
+        let calendar = Calendar.current
+        return healthManager.workoutLogs.filter { log in calendar.isDate(log.date, equalTo: selectedViewingMonth, toGranularity: .month) }
+    }
+
+    var monthlyCaloriesConsumed: Double { validMonthLogs.reduce(0) { $0 + $1.calories } }
+    var monthlyWorkoutCalories: Double { validMonthWorkouts.reduce(0) { $0 + $1.caloriesBurned } }
+
+    var monthlyCalorieTarget: Double {
+        let mealDates = validMonthLogs.map { Calendar.current.startOfDay(for: $0.date) }
+        let workoutDates = validMonthWorkouts.map { Calendar.current.startOfDay(for: $0.date) }
+        return (healthManager.profile.baseDailyTargetCalories * Double(max(1, Set(mealDates + workoutDates).count))) + monthlyWorkoutCalories
+    }
+    var netCalorieBalance: Double { monthlyCaloriesConsumed - monthlyCalorieTarget }
+    var estimatedKgChange: Double { netCalorieBalance / 7700.0 }
+
+    var groupedLogs: [(Date, [DailyEntry])] {
+        var combined: [DailyEntry] = validMonthLogs.map { DailyEntry(date: $0.date, isWorkout: false, title: $0.categoryItem.name, subtitle: $0.customName, calories: $0.calories, emoji: $0.categoryItem.emoji) }
+        combined.append(contentsOf: validMonthWorkouts.map { DailyEntry(date: $0.date, isWorkout: true, title: $0.workoutType, subtitle: "HealthKit", calories: $0.caloriesBurned, emoji: "🔥") })
+
+        let grouped = Dictionary(grouping: combined) { Calendar.current.startOfDay(for: $0.date) }
+        return grouped.map { (date: $0.key, logs: $0.value.sorted { $0.date > $1.date }) }.sorted { $0.date > $1.date }
+    }
+
+    func formatDate(_ date: Date) -> String { let f = DateFormatter(); f.dateFormat = "E, MMM d, yyyy"; return f.string(from: date) }
+    func formatMonthYear(_ date: Date) -> String { let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f.string(from: date) }
+    func deleteLog(id: UUID, isWorkout: Bool) { if isWorkout { healthManager.workoutLogs.removeAll { $0.id == id } } else { mealLogs.removeAll { $0.id == id } } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Navbar
+            HStack {
+                Button(action: { withAnimation(.spring()) { isMenuOpen.toggle() } }) { Image(systemName: "line.3.horizontal").font(.title2).foregroundColor(.primary) }
+                Spacer()
+                Button(action: { showingMonthPicker = true }) {
+                    HStack(spacing: 4) { Text(formatMonthYear(selectedViewingMonth)).font(.headline).foregroundColor(.primary); Image(systemName: "arrowtriangle.down.fill").font(.caption2).foregroundColor(.secondary) }
+                }
+                Spacer()
+
+                Button(action: { healthManager.generateLocalWeeklyReport(from: mealLogs); showingNotifications = true }) {
+                    Image(systemName: "doc.text.magnifyingglass").padding(.trailing, 10).foregroundColor(.primary)
+                }
+
+                Button(action: { showingNotifications = true }) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "bell").foregroundColor(.primary)
+                        if !healthManager.notifications.isEmpty { Circle().fill(Color.red).frame(width: 8, height: 8).offset(x: 2, y: -2) }
+                    }.padding(.trailing, 10)
+                }
+                Button(action: { showingCalendarOverview = true }) { Image(systemName: "calendar").foregroundColor(.primary) }
+            }
+            .padding().background(.ultraThinMaterial).background(themeManager.currentTheme == .muzliDark ? Color.black.opacity(0.4) : Color.clear).overlay(Rectangle().frame(height: 1).foregroundColor(Color.primary.opacity(0.1)), alignment: .bottom)
+
+            ZStack(alignment: .bottom) {
+                List {
+                    // Dashboard Card
+                    VStack(spacing: 0) {
+                        HStack {
+                            Button(action: { showingIntakeDetails = true }) { VStack(alignment: .leading) { Text("Intake").font(.subheadline).foregroundColor(.secondary); Text("\(monthlyCaloriesConsumed, specifier: "%.0f")").font(.title3).bold().foregroundColor(.primary) } }.buttonStyle(PlainButtonStyle())
+                            Spacer(); VStack(alignment: .center) { Text("Burned").font(.subheadline).foregroundColor(.secondary); Text("\(monthlyWorkoutCalories, specifier: "%.0f")").font(.title3).bold().foregroundColor(.primary) }
+                            Spacer(); VStack(alignment: .trailing) { Text("Target").font(.subheadline).foregroundColor(.secondary); Text("\(monthlyCalorieTarget, specifier: "%.0f")").font(.title3).bold().foregroundColor(.primary) }
+                        }.padding(.top, 25).padding(.horizontal, 20)
+
+                        ZStack {
+                            Circle().stroke(Color.primary.opacity(0.05), lineWidth: 35).padding(18)
+                            Circle().stroke(themeManager.currentTheme == .classicWhite ? Color.cyan.opacity(0.8) : Color(red: 0.2, green: 0.6, blue: 1.0).opacity(0.4), lineWidth: 35).padding(18)
+                            Circle().trim(from: 0.0, to: min(1.0, CGFloat(monthlyCaloriesConsumed / max(1, monthlyCalorieTarget))))
+                                .stroke(themeManager.currentTheme == .classicWhite ? Color.yellow : Color(red: 1.0, green: 0.82, blue: 0.4), style: StrokeStyle(lineWidth: 35, lineCap: themeManager.currentTheme == .muzliDark ? .round : .butt)).rotationEffect(.degrees(-90)).padding(18)
+
+                            VStack(spacing: 2) {
+                                if themeManager.currentTheme == .classicWhite {
+                                    Image(systemName: "flame.fill").foregroundColor(.orange).font(.title)
+                                    if netCalorieBalance <= 0 { Text("Deficit").font(.caption).foregroundColor(.primary); Text("\(abs(netCalorieBalance), specifier: "%.0f") kcal").font(.title3).bold().foregroundColor(.green) }
+                                    else { Text("Surplus").font(.caption).foregroundColor(.primary); Text("+\(netCalorieBalance, specifier: "%.0f") kcal").font(.title3).bold().foregroundColor(.red) }
+                                } else {
+                                    Text("\(Int(min(100.0, (monthlyCaloriesConsumed / max(1, monthlyCalorieTarget)) * 100)))%").font(.system(size: 38, weight: .bold)).foregroundColor(.white)
+                                    if netCalorieBalance <= 0 { Text("\(abs(netCalorieBalance), specifier: "%.0f") left").font(.caption).foregroundColor(.white.opacity(0.6)) }
+                                    else { Text("+\(netCalorieBalance, specifier: "%.0f") over").font(.caption).foregroundColor(Color(red: 1.0, green: 0.35, blue: 0.45)) }
+                                }
+                            }
+                        }.aspectRatio(1, contentMode: .fit).padding(.horizontal, 40).padding(.vertical, 30)
+
+                        HStack {
+                            let isLoss = estimatedKgChange <= 0
+                            Image(systemName: isLoss ? "arrow.down.right.circle.fill" : "arrow.up.right.circle.fill").foregroundColor(isLoss ? (themeManager.currentTheme == .classicWhite ? .green : Color(red: 0.02, green: 0.84, blue: 0.63)) : .red)
+                            Text(isLoss ? "Est. Loss: " : "Est. Gain: ").foregroundColor(.primary); Text("\(abs(estimatedKgChange), specifier: "%.2f") kg").bold().foregroundColor(.primary)
+                        }.padding(.vertical, 12).frame(maxWidth: .infinity).background(estimatedKgChange <= 0 ? Color.green.opacity(0.1) : Color.red.opacity(0.1)).cornerRadius(10).padding(.horizontal, 20).padding(.bottom, 25)
+                    }.themeGlassStyle().listRowBackground(Color.clear).listRowSeparator(.hidden).padding(.vertical, 10)
+
+                    // Logs
+                    if groupedLogs.isEmpty { Text("No logs yet.").foregroundColor(.secondary).listRowBackground(Color.clear) }
+                    else {
+                        ForEach(groupedLogs, id: \.0) { date, dailyLogs in
+                            Section {
+                                ForEach(dailyLogs) { log in
+                                    HStack {
+                                        Text(log.emoji).font(.title)
+                                        VStack(alignment: .leading) {
+                                            Text(log.title).font(.body).foregroundColor(.primary)
+                                            if let custom = log.subtitle, !custom.isEmpty { Text(custom).font(.caption).foregroundColor(.secondary) }
+                                        }
+                                        Spacer()
+                                        if log.isWorkout { Text("+\(log.calories, specifier: "%.0f") kcal").font(.body).foregroundColor(.green) }
+                                        else { Text("-\(log.calories, specifier: "%.0f") kcal").font(.body).foregroundColor(.primary) }
+                                    }.padding(.vertical, 4).listRowBackground(Color.primary.opacity(0.05)).swipeActions(edge: .trailing, allowsFullSwipe: true) { Button(role: .destructive) { deleteLog(id: log.id, isWorkout: log.isWorkout) } label: { Label("Delete", systemImage: "trash") } }
+                                }
+                            } header: {
+                                HStack {
+                                    Text(formatDate(date)).font(.headline).foregroundColor(.primary)
+                                    Spacer()
+                                    let consumed = dailyLogs.filter({ !$0.isWorkout }).reduce(0) { $0 + $1.calories }, burned = dailyLogs.filter({ $0.isWorkout }).reduce(0) { $0 + $1.calories }
+                                    Text("\((consumed - burned), specifier: "%.0f") kcal Net").font(.subheadline).foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    Color.clear.frame(height: 100).listRowBackground(Color.clear).listRowSeparator(.hidden)
+                }.listStyle(.insetGrouped).scrollContentBackground(.hidden)
+
+                Button(action: { showingAddMeal = true }) {
+                    Image(systemName: "plus").font(.system(size: 30, weight: .bold)).foregroundColor(themeManager.currentTheme == .classicWhite ? .white : Color(red: 0.12, green: 0.16, blue: 0.20))
+                        .frame(width: 65, height: 65).background(themeManager.currentTheme == .classicWhite ? Color.red : Color(red: 0.02, green: 0.84, blue: 0.63)).clipShape(Circle())
+                        .overlay(Circle().stroke(themeManager.currentTheme == .classicWhite ? Color.black : Color.clear, lineWidth: themeManager.currentTheme == .classicWhite ? 2 : 0))
+                        .shadow(color: themeManager.currentTheme == .classicWhite ? Color.black.opacity(0.2) : Color(red: 0.02, green: 0.84, blue: 0.63).opacity(0.4), radius: 10, x: 0, y: 5)
+                }.padding(.bottom, 30)
+
+                .fullScreenCover(isPresented: $showingAddMeal) { AddMealLogView(mealLogs: $mealLogs, savedTemplates: $savedMealTemplates, healthManager: healthManager) }
+                .sheet(isPresented: $showingMonthPicker) { MonthYearPickerView(selectedDate: $selectedViewingMonth).presentationDetents([.medium]) }
+                .sheet(isPresented: $showingNotifications) { NotificationsView(healthManager: healthManager).presentationDetents([.medium, .large]) }
+                .sheet(isPresented: $showingCalendarOverview) { CalendarOverviewView(mealLogs: $mealLogs, viewingDate: selectedViewingMonth) }
+                .sheet(isPresented: $showingIntakeDetails) { IntakeDetailView(validMonthLogs: validMonthLogs) }
+            }
+        }
+        .onAppear {
+            if let data = UserDefaults.standard.data(forKey: "savedMealLogs"), let decoded = try? JSONDecoder().decode([MealLog].self, from: data) { mealLogs = decoded }
+            if let templateData = UserDefaults.standard.data(forKey: "savedMealTemplates"), let decodedTemplates = try? JSONDecoder().decode([MealLog].self, from: templateData) { savedMealTemplates = decodedTemplates }
+        }
+        .onChange(of: mealLogs) { _, newValue in if let encoded = try? JSONEncoder().encode(newValue) { UserDefaults.standard.set(encoded, forKey: "savedMealLogs") } }
+        .onChange(of: savedMealTemplates) { _, newValue in if let encoded = try? JSONEncoder().encode(newValue) { UserDefaults.standard.set(encoded, forKey: "savedMealTemplates") } }
+    }
+}
+
+// MARK: - 6. ADD MEAL VIEW
+struct AddMealLogView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    @Binding var mealLogs: [MealLog]
+    @Binding var savedTemplates: [MealLog]
+    @ObservedObject var healthManager: HealthManager
+
+    @State private var selectedDate = Date()
+    @State private var showingCalendar = false
+    @State private var showingNewCategorySheet = false
+    @State private var isEditing = false
+    @State private var isExpanded = false
+
+    @State private var customMealName = ""
+    @State private var typedAmount = "0"
+    @State private var previousValue: Double = 0
+    @State private var currentOperation: Operator? = nil
+    @State private var isTypingNumber = false
+
+    @State private var isAdvancedMode = false
+    @State private var advancedWeight = ""
+    @State private var advancedCuisine = ""
+    @State private var isManualMacros = false
+    @State private var macroProtein = ""
+    @State private var macroCarbs = ""
+    @State private var macroFat = ""
+    @State private var macroFiber = ""
+    @State private var saveAsTemplate = false
+    @State private var isFetchingAPI = false
+
+    @FocusState private var isInputFocused: Bool
+    @State private var selectedCategory: CategoryItem = CategoryItem(name: "Lunch", emoji: "🥗")
+
+    enum Operator { case add, subtract, multiply, divide }
+    let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
+
+    var body: some View {
+        ZStack {
+            ThemeBackgroundView().onTapGesture { isInputFocused = false }.ignoresSafeArea(.keyboard)
+
+            GeometryReader { mainGeo in
+                VStack(spacing: 0) {
+
+                    // TOP BAR
+                    HStack {
+                        Button(action: { dismiss() }) { Image(systemName: "chevron.left").foregroundColor(.primary).font(.title2) }
+                        Spacer()
+                        Picker("Mode", selection: $isAdvancedMode) { Text("Quick").tag(false); Text("Advanced").tag(true) }.pickerStyle(.segmented).frame(width: 160)
+                        Spacer()
+                        Button(action: { withAnimation { isEditing.toggle() } }) { Image(systemName: isEditing ? "checkmark.circle.fill" : "ellipsis").foregroundColor(isEditing ? .red : .primary).font(.title2).padding(10).contentShape(Rectangle()) }
+                    }.padding()
+
+                    if !isAdvancedMode {
+                        VStack(spacing: 0) {
+                            LazyVGrid(columns: columns, spacing: 15) {
+                                ForEach(healthManager.customCategories, id: \.self) { category in
+                                    ZStack(alignment: .topTrailing) {
+                                        VStack(spacing: 8) {
+                                            ZStack {
+                                                if selectedCategory.name == category.name { Circle().fill(Color.primary.opacity(0.1)).frame(width: 50, height: 50) }
+                                                Text(category.emoji).font(.system(size: 28))
+                                            }
+                                            Text(category.name).font(.system(size: 12)).foregroundColor(.primary).lineLimit(1)
+                                        }.contentShape(Rectangle()).onTapGesture { selectedCategory = category; isInputFocused = false }
+
+                                        if isEditing {
+                                            Button(action: { healthManager.customCategories.removeAll { $0 == category } }) {
+                                                Image(systemName: "minus.circle.fill").font(.title3).foregroundColor(.red).background(Circle().fill(Color.white))
+                                            }.offset(x: 10, y: -10)
+                                        }
+                                    }
+                                }
+                                VStack(spacing: 8) { ZStack { Circle().stroke(Color.primary.opacity(0.3), lineWidth: 1).frame(width: 50, height: 50); Image(systemName: "plus").font(.title2).foregroundColor(.primary.opacity(0.5)) }; Text("Add").font(.system(size: 12)).foregroundColor(.primary.opacity(0.5)) }.onTapGesture { showingNewCategorySheet = true }
+                            }.padding(.horizontal)
+
+                            Spacer(); Divider().background(Color.primary.opacity(0.1))
+                            HStack {
+                                HStack(spacing: 8) {
+                                    Text(selectedCategory.emoji).padding(6).background(Color.primary.opacity(0.1)).clipShape(Circle()).font(.title3)
+                                    Text("KCAL").font(.caption).bold().foregroundColor(.secondary)
+                                    Text(typedAmount).font(.title2).bold().foregroundColor(.primary)
+                                }
+                                Spacer(); Divider().frame(height: 30).background(Color.primary.opacity(0.1)); Spacer()
+
+                                if isExpanded {
+                                    TextEditor(text: $customMealName).focused($isInputFocused).frame(height: 40).multilineTextAlignment(.trailing).scrollContentBackground(.hidden)
+                                } else {
+                                    TextField("Tap here to write", text: $customMealName).focused($isInputFocused).multilineTextAlignment(.trailing).foregroundColor(.primary).font(.callout)
+                                }
+                                Button(action: { isExpanded.toggle() }) { Image(systemName: "arrow.up.left.and.arrow.down.right").foregroundColor(.blue).font(.caption).padding(.leading, 4) }
+                            }.padding(.horizontal).frame(height: 60)
+                        }.frame(height: mainGeo.size.height * 0.38).themeGlassStyle().padding(10)
+
+                        if !isInputFocused {
+                            VStack(spacing: 0) {
+                                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingCalendar = true } }) {
+                                    HStack { Image(systemName: "arrowtriangle.backward.fill").font(.caption); Spacer(); Image(systemName: "calendar"); Text(formatDateWithToday(selectedDate)).bold(); Spacer(); Image(systemName: "arrowtriangle.forward.fill").font(.caption) }
+                                        .foregroundColor(.primary).frame(maxWidth: .infinity).padding(.vertical, 12).padding(.horizontal, 15)
+                                        .background(Color.primary.opacity(0.05)).overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.1), lineWidth: 1)).padding(.horizontal, 15).padding(.top, 5)
+                                }
+
+                                GeometryReader { keypadGeo in
+                                    let hSpacing: CGFloat = 10, vSpacing: CGFloat = 10
+                                    let maxW = (keypadGeo.size.width - (hSpacing * 4)) / 4
+                                    let maxH = (keypadGeo.size.height - (vSpacing * 5) - 20) / 4
+                                    let btnSize = min(maxW, maxH)
+
+                                    VStack {
+                                        Spacer()
+                                        HStack(spacing: hSpacing) {
+                                            VStack(spacing: vSpacing) { KeyButton(text: "7", size: btnSize) { append("7") }; KeyButton(text: "4", size: btnSize) { append("4") }; KeyButton(text: "1", size: btnSize) { append("1") }; KeyButton(text: "00", size: btnSize) { append("00") } }
+                                            VStack(spacing: vSpacing) { KeyButton(text: "8", size: btnSize) { append("8") }; KeyButton(text: "5", size: btnSize) { append("5") }; KeyButton(text: "2", size: btnSize) { append("2") }; KeyButton(text: "0", size: btnSize) { append("0") } }
+                                            VStack(spacing: vSpacing) { KeyButton(text: "9", size: btnSize) { append("9") }; KeyButton(text: "6", size: btnSize) { append("6") }; KeyButton(text: "3", size: btnSize) { append("3") }; KeyButton(text: ".", size: btnSize) { append(".") } }
+                                            VStack(spacing: vSpacing) { let blue = themeManager.currentTheme == .classicWhite ? Color(red: 0.33, green: 0.72, blue: 0.9) : Color(red: 0.2, green: 0.6, blue: 1.0); KeyButton(text: "÷", color: blue, size: btnSize) { operationTapped(.divide) }; KeyButton(text: "×", color: blue, size: btnSize) { operationTapped(.multiply) }; KeyButton(text: "+", color: blue, size: btnSize) { operationTapped(.add) }; KeyButton(text: "-", color: blue, size: btnSize) { operationTapped(.subtract) } }
+                                            VStack(spacing: vSpacing) {
+                                                let blue = themeManager.currentTheme == .classicWhite ? Color(red: 0.33, green: 0.72, blue: 0.9) : Color(red: 0.2, green: 0.6, blue: 1.0)
+                                                KeyButton(text: "AC", color: blue, size: btnSize) { typedAmount = "0"; previousValue = 0; currentOperation = nil; isTypingNumber = false }
+                                                KeyButton(systemIcon: "arrow.left", color: blue, size: btnSize) { if isTypingNumber { if typedAmount.count > 1 { typedAmount.removeLast() } else { typedAmount = "0"; isTypingNumber = false } } }
+                                                Button(action: {
+                                                    if currentOperation != nil { calculateResult() }
+                                                    else if let amount = Double(typedAmount), amount > 0 {
+                                                        let nameToSave = customMealName.trimmingCharacters(in: .whitespaces).isEmpty ? nil : customMealName
+                                                        // Fixed Bug: Safely storing the category item directly
+                                                        mealLogs.append(MealLog(date: selectedDate, categoryItem: selectedCategory, customName: nameToSave, calories: amount))
+                                                        dismiss()
+                                                    }
+                                                }) {
+                                                    Text(currentOperation != nil ? "=" : "OK").font(currentOperation != nil ? .title : .title3).bold().foregroundColor(themeManager.currentTheme == .classicWhite ? .white : Color(red: 0.12, green: 0.16, blue: 0.20)).frame(width: btnSize, height: (btnSize * 2) + vSpacing).background(themeManager.currentTheme == .classicWhite ? Color.red.opacity(0.8) : Color(red: 0.02, green: 0.84, blue: 0.63))
+                                                    .clipShape(Capsule())
+                                                    .overlay(Capsule().stroke(themeManager.currentTheme == .classicWhite ? Color.black : Color.clear, lineWidth: themeManager.currentTheme == .classicWhite ? 2 : 0))
+                                                }
+                                            }
+                                        }.padding(.horizontal, hSpacing); Spacer()
+                                    }
+                                }
+                            }.frame(height: mainGeo.size.height * 0.60).transition(.opacity)
+                        } else { Spacer() }
+
+                    } else {
+                        // ADVANCED ADD FLOW
+                        ScrollView {
+                            VStack(spacing: 20) {
+                                if !savedTemplates.isEmpty {
+                                    VStack(alignment: .leading) {
+                                        Text("Saved Templates").font(.caption).foregroundColor(.secondary).padding(.horizontal)
+                                        ScrollView(.horizontal, showsIndicators: false) {
+                                            HStack {
+                                                ForEach(savedTemplates) { template in
+                                                    Button(action: {
+                                                        customMealName = template.customName ?? ""; advancedCuisine = template.cuisineType ?? ""; advancedWeight = template.weightGrams != nil ? String(template.weightGrams!) : ""
+                                                        if let matchingCategory = healthManager.customCategories.first(where: { $0.name == template.categoryItem.name }) { selectedCategory = matchingCategory }
+                                                        typedAmount = String(template.calories)
+                                                    }) {
+                                                        VStack(alignment: .leading) { Text(template.categoryItem.emoji).font(.title); Text(template.customName ?? "Meal").font(.subheadline).bold().foregroundColor(.primary).lineLimit(1); Text("\(template.calories, specifier: "%.0f") kcal").font(.caption).foregroundColor(.secondary) }.padding().frame(width: 120).background(Color.primary.opacity(0.05)).cornerRadius(12)
+                                                    }
+                                                }
+                                            }.padding(.horizontal)
+                                        }
+                                    }
+                                }
+                                VStack(spacing: 0) {
+                                    HStack { Text("Category"); Spacer(); Picker("Cat", selection: $selectedCategory) { ForEach(healthManager.customCategories, id: \.self) { c in Text(c.emoji + " " + c.name).tag(c) } }.pickerStyle(.menu) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                    HStack { Text("Meal Name"); Spacer(); TextField("e.g. Chicken Biryani", text: $customMealName).focused($isInputFocused).multilineTextAlignment(.trailing) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                    HStack { Text("Cuisine Type"); Spacer(); TextField("e.g. South Asian", text: $advancedCuisine).focused($isInputFocused).multilineTextAlignment(.trailing) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                    HStack { Text("Weight (g)"); Spacer(); TextField("e.g. 250", text: $advancedWeight).focused($isInputFocused).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.padding()
+                                }.themeGlassStyle().padding(.horizontal)
+
+                                Toggle("Enter Detailed Macros", isOn: $isManualMacros).padding(.horizontal, 25).foregroundColor(.primary)
+                                if isManualMacros {
+                                    VStack(spacing: 0) {
+                                        HStack { Text("Protein (g)").foregroundColor(.primary); Spacer(); TextField("0", text: $macroProtein).focused($isInputFocused).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                        HStack { Text("Carbs (g)").foregroundColor(.primary); Spacer(); TextField("0", text: $macroCarbs).focused($isInputFocused).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                        HStack { Text("Fat (g)").foregroundColor(.primary); Spacer(); TextField("0", text: $macroFat).focused($isInputFocused).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.padding(); Divider().background(Color.primary.opacity(0.1))
+                                        HStack { Text("Fiber (g)").foregroundColor(.primary); Spacer(); TextField("0", text: $macroFiber).focused($isInputFocused).keyboardType(.decimalPad).multilineTextAlignment(.trailing) }.padding()
+                                    }.themeGlassStyle().padding(.horizontal)
+                                }
+                                Toggle("Save as Reusable Template", isOn: $saveAsTemplate).padding(.horizontal, 25).foregroundColor(.primary)
+                                Button(action: {
+                                    Task {
+                                        isFetchingAPI = true; var finalCalories: Double = 0
+                                        // Fixed bug: Removed the invalid `try!` before the await calls
+                                        if isManualMacros { finalCalories = await healthManager.validateMacros(protein: Double(macroProtein) ?? 0, carbs: Double(macroCarbs) ?? 0, fiber: Double(macroFiber) ?? 0, fat: Double(macroFat) ?? 0) }
+                                        else { finalCalories = await healthManager.fetchMealEstimate(name: customMealName, weight: Double(advancedWeight) ?? 0, cuisine: advancedCuisine) }
+                                        let nameToSave = customMealName.trimmingCharacters(in: .whitespaces).isEmpty ? "Advanced Meal" : customMealName
+                                        
+                                        let newLog = MealLog(date: selectedDate, categoryItem: selectedCategory, customName: nameToSave, calories: finalCalories, weightGrams: Double(advancedWeight), cuisineType: advancedCuisine, proteinGrams: Double(macroProtein), carbsGrams: Double(macroCarbs), fatGrams: Double(macroFat), fiberGrams: Double(macroFiber), isSavedTemplate: saveAsTemplate)
+                                        mealLogs.append(newLog)
+                                        if saveAsTemplate { savedTemplates.append(newLog) }
+                                        isFetchingAPI = false; dismiss()
+                                    }
+                                }) {
+                                    HStack { if isFetchingAPI { ProgressView().progressViewStyle(CircularProgressViewStyle(tint: .white)) } else { Text(isManualMacros ? "Validate & Log Meal" : "Estimate & Log Meal").font(.headline).foregroundColor(themeManager.currentTheme == .classicWhite ? .white : Color(red: 0.12, green: 0.16, blue: 0.20)) } }
+                                    .frame(maxWidth: .infinity).padding().background(themeManager.currentTheme == .classicWhite ? Color.blue : Color(red: 0.02, green: 0.84, blue: 0.63)).cornerRadius(12).overlay(RoundedRectangle(cornerRadius: 12).stroke(themeManager.currentTheme == .classicWhite ? Color.black : Color.clear, lineWidth: themeManager.currentTheme == .classicWhite ? 2 : 0))
+                                }.padding(.horizontal).padding(.top, 10).disabled(isFetchingAPI)
+                                Spacer().frame(height: 50)
+                            }
+                        }
+                    }
+                }
+            }.blur(radius: showingCalendar ? 5 : 0)
+
+            if showingCalendar {
+                ZStack {
+                    Color.black.opacity(0.4).ignoresSafeArea().onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { showingCalendar = false } }
+                    VStack(spacing: 0) {
+                        DatePicker("Select Date", selection: $selectedDate, displayedComponents: .date).datePickerStyle(.graphical).padding().background(Color(UIColor.systemBackground))
+                        Divider()
+                        HStack { Button("Today") { selectedDate = Date() }.font(.headline).foregroundColor(.blue); Spacer(); Button("Done") { withAnimation(.easeInOut(duration: 0.2)) { showingCalendar = false } }.font(.headline).foregroundColor(.red) }.padding(.horizontal, 20).padding(.vertical, 15).background(Color(UIColor.secondarySystemGroupedBackground))
+                    }.cornerRadius(20).overlay(RoundedRectangle(cornerRadius: 20).stroke(themeManager.currentTheme == .classicWhite ? Color.black : Color.clear, lineWidth: 2)).padding(30).shadow(radius: 20)
+                }.zIndex(2).transition(.opacity)
+            }
+        // Fixed bug: Safely handling empty custom categories arrays to prevent out of bound index crashes
+        }.sheet(isPresented: $showingNewCategorySheet) { NewCategoryView(healthManager: healthManager) }.onAppear { selectedCategory = healthManager.customCategories.first ?? CategoryItem(name: "Lunch", emoji: "🥗") }
+    }
+
+    func append(_ number: String) { if !isTypingNumber { typedAmount = number == "." ? "0." : number; isTypingNumber = true } else { if typedAmount == "0" && number != "." && number != "00" { typedAmount = number } else { typedAmount += number } } }
+    func operationTapped(_ op: Operator) { if isTypingNumber && currentOperation != nil { calculateResult() }; if let current = Double(typedAmount) { previousValue = current }; currentOperation = op; isTypingNumber = false }
+    func calculateResult() { guard let current = Double(typedAmount), let op = currentOperation else { return }; var result: Double = 0; switch op { case .add: result = previousValue + current; case .subtract: result = previousValue - current; case .multiply: result = previousValue * current; case .divide: result = current != 0 ? previousValue / current : 0 }; let formatter = NumberFormatter(); formatter.minimumFractionDigits = 0; formatter.maximumFractionDigits = 2; typedAmount = formatter.string(from: NSNumber(value: result)) ?? "0"; previousValue = result; currentOperation = nil; isTypingNumber = false }
+    func formatDateWithToday(_ date: Date) -> String { let f = DateFormatter(); f.dateFormat = "E, MMM d, yyyy"; return Calendar.current.isDateInToday(date) ? "Today " + f.string(from: date) : f.string(from: date) }
+}
+
+// MARK: - 7. NOTIFICATIONS & MODALS
+struct NotificationsView: View {
+    @Environment(\.dismiss) var dismiss
+    @ObservedObject var healthManager: HealthManager
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                List {
+                    Section(header: Text("Recent Insights").foregroundColor(.secondary)) {
+                        if healthManager.notifications.isEmpty { Text("No new notifications.").foregroundColor(.secondary).listRowBackground(Color.primary.opacity(0.05)) }
+                        else { ForEach(healthManager.notifications) { notif in NotificationRow(notification: notif).listRowBackground(Color.primary.opacity(0.05)) } }
+                    }
+                }.scrollContentBackground(.hidden)
+            }.navigationTitle("Notifications").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Close") { dismiss() }.foregroundColor(.primary) } }
+        }
+    }
+}
+
+struct NotificationRow: View {
+    var notification: AppNotification
+    @State private var isExpanded = false
+    var body: some View {
+        HStack(alignment: .top, spacing: 15) {
+            Image(systemName: notification.icon).foregroundColor(Color(red: notification.colorR, green: notification.colorG, blue: notification.colorB)).font(.title2).frame(width: 30)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack { Text(notification.title).font(.headline).foregroundColor(.primary); Spacer(); Text(notification.date, style: .time).font(.caption).foregroundColor(.secondary) }
+                Text(notification.text).font(.subheadline).foregroundColor(.secondary).lineLimit(isExpanded ? nil : 2).animation(.easeInOut, value: isExpanded)
+                Button(action: { withAnimation { isExpanded.toggle() } }) { Text(isExpanded ? "Show Less" : "Read More").font(.caption).bold().foregroundColor(.blue) }.padding(.top, 2)
+            }
+        }.padding(.vertical, 5)
+    }
+}
+
+struct NewCategoryView: View {
+    @Environment(\.dismiss) var dismiss
+    @ObservedObject var healthManager: HealthManager
+    @State private var name: String = ""
+    @State private var emoji: String = ""
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                Form {
+                    TextField("Category Name", text: $name).listRowBackground(Color.primary.opacity(0.05))
+                    TextField("Emoji (e.g. 🍎)", text: $emoji).listRowBackground(Color.primary.opacity(0.05))
+                }.scrollContentBackground(.hidden)
+            }.navigationTitle("New Category").toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("Cancel") { dismiss() }.foregroundColor(.primary) }
+                ToolbarItem(placement: .navigationBarTrailing) { Button("Save") { if !name.isEmpty && !emoji.isEmpty { healthManager.customCategories.append(CategoryItem(name: name, emoji: emoji)); dismiss() } }.bold().foregroundColor(.blue) }
+            }
+        }
+    }
+}
+
+struct KeyButton: View {
+    @EnvironmentObject var themeManager: ThemeManager
+    var text: String? = nil
+    var systemIcon: String? = nil
+    var color: Color = Color.primary.opacity(0.05)
+    var size: CGFloat
+    var action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(color).background(.ultraThinMaterial).clipShape(Circle())
+                Circle().stroke(themeManager.currentTheme == .classicWhite ? Color.black : Color.white.opacity(0.1), lineWidth: themeManager.currentTheme == .classicWhite ? 2 : 1)
+                if let text = text { Text(text).font(.title2).foregroundColor(.primary) } else if let icon = systemIcon { Image(systemName: icon).font(.title2).foregroundColor(.primary) }
+            }.frame(width: size, height: size)
+        }
+    }
+}
+
+struct MonthYearPickerView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    @Binding var selectedDate: Date
+    @State private var currentYear: Int
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    let columns = [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())]
+    init(selectedDate: Binding<Date>) { self._selectedDate = selectedDate; _currentYear = State(initialValue: Calendar.current.component(.year, from: selectedDate.wrappedValue)) }
+    var body: some View {
+        ZStack {
+            ThemeBackgroundView()
+            VStack(spacing: 20) {
+                HStack { Button(action: { currentYear -= 1 }) { Image(systemName: "chevron.left").font(.title2).foregroundColor(.primary) }; Spacer(); Text(String(currentYear)).font(.title).bold().foregroundColor(.primary); Spacer(); Button(action: { currentYear += 1 }) { Image(systemName: "chevron.right").font(.title2).foregroundColor(.primary) } }.padding(.horizontal, 40).padding(.top, 30)
+                LazyVGrid(columns: columns, spacing: 20) {
+                    ForEach(0..<12, id: \.self) { index in
+                        let isSelected = Calendar.current.component(.month, from: selectedDate) == index + 1 && Calendar.current.component(.year, from: selectedDate) == currentYear
+                        Button(action: { var comp = DateComponents(); comp.year = currentYear; comp.month = index + 1; comp.day = 1; if let d = Calendar.current.date(from: comp) { selectedDate = d; dismiss() } }) { Text(months[index]).font(.headline).foregroundColor(isSelected ? (themeManager.currentTheme == .muzliDark ? Color(red: 0.12, green: 0.16, blue: 0.20) : .white) : .primary).frame(width: 60, height: 60).background(isSelected ? (themeManager.currentTheme == .muzliDark ? Color(red: 0.02, green: 0.84, blue: 0.63) : .blue) : Color.primary.opacity(0.05)).clipShape(Circle()) }
+                    }
+                }.padding(); Spacer()
+            }
+        }
+    }
+}
+
+struct CalendarOverviewView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    @Binding var mealLogs: [MealLog]
+    @State var viewingDate: Date
+    let daysOfWeek = ["S", "M", "T", "W", "T", "F", "S"]
+    let columns = Array(repeating: GridItem(.flexible()), count: 7)
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                VStack {
+                    HStack { Button(action: { changeMonth(by: -1) }) { Image(systemName: "chevron.left").font(.title2).foregroundColor(.primary) }; Spacer(); Text(formatMonthYear(viewingDate)).font(.title2).bold().foregroundColor(.primary); Spacer(); Button(action: { changeMonth(by: 1) }) { Image(systemName: "chevron.right").font(.title2).foregroundColor(.primary) } }.padding()
+                    HStack { ForEach(daysOfWeek, id: \.self) { day in Text(day).font(.caption).bold().foregroundColor(.secondary).frame(maxWidth: .infinity) } }.padding(.horizontal)
+                    LazyVGrid(columns: columns, spacing: 15) {
+                        ForEach(generateDaysInMonth(), id: \.self) { date in
+                            if let date = date {
+                                let hasLog = mealLogs.contains { Calendar.current.isDate($0.date, inSameDayAs: date) }
+                                let isToday = Calendar.current.isDateInToday(date)
+                                VStack(spacing: 4) {
+                                    Text("\(Calendar.current.component(.day, from: date))").font(.headline).foregroundColor(isToday ? (themeManager.currentTheme == .muzliDark ? Color(red: 0.12, green: 0.16, blue: 0.20) : .white) : .primary).frame(width: 35, height: 35).background(isToday ? (themeManager.currentTheme == .muzliDark ? Color(red: 0.02, green: 0.84, blue: 0.63) : .red) : Color.clear).clipShape(Circle())
+                                    Circle().fill(hasLog ? .orange : Color.clear).frame(width: 6, height: 6)
+                                }
+                            } else { Color.clear.frame(width: 35, height: 35) }
+                        }
+                    }.padding(); Spacer()
+                }
+            }.navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() }.foregroundColor(.primary) } }
+        }
+    }
+    func formatMonthYear(_ date: Date) -> String { let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f.string(from: date) }
+    func changeMonth(by value: Int) { if let newDate = Calendar.current.date(byAdding: .month, value: value, to: viewingDate) { viewingDate = newDate } }
+    func generateDaysInMonth() -> [Date?] {
+        let calendar = Calendar.current, components = calendar.dateComponents([.year, .month], from: viewingDate)
+        guard let startOfMonth = calendar.date(from: components), let range = calendar.range(of: .day, in: .month, for: startOfMonth) else { return [] }
+        let firstWeekday = calendar.component(.weekday, from: startOfMonth)
+        var days: [Date?] = Array(repeating: nil, count: firstWeekday - 1)
+        for day in range { if let date = calendar.date(byAdding: .day, value: day - 1, to: startOfMonth) { days.append(date) } }
+        return days
+    }
+}
+
+struct IntakeDetailView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var themeManager: ThemeManager
+    let validMonthLogs: [MealLog]
+    @State private var selectedCategory: CategoryItem?
+
+    var categoryBreakdown: [(categoryItem: CategoryItem, calories: Double, percentage: Double)] {
+        let total = validMonthLogs.reduce(0) { $0 + $1.calories }, grouped = Dictionary(grouping: validMonthLogs) { $0.categoryItem }
+        return grouped.map { (key, logs) in let catTotal = logs.reduce(0) { $0 + $1.calories }, percent = total > 0 ? (catTotal / total) * 100 : 0; return (categoryItem: key, calories: catTotal, percentage: percent) }.sorted { $0.calories > $1.calories }
+    }
+    var dailyTotals: [(date: Date, calories: Double)] { return Dictionary(grouping: validMonthLogs) { Calendar.current.startOfDay(for: $0.date) }.map { (date: $0.key, calories: $0.value.reduce(0) { $0 + $1.calories }) }.sorted { $0.date < $1.date } }
+
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                VStack {
+                    TabView {
+                        VStack {
+                            Text("Calorie Distribution").font(.headline).foregroundColor(.secondary)
+                            if categoryBreakdown.isEmpty { Text("No data").foregroundColor(.secondary).padding() }
+                            else { Chart { ForEach(categoryBreakdown, id: \.categoryItem.name) { item in SectorMark(angle: .value("Calories", item.calories), innerRadius: .ratio(0.55), angularInset: 1.5).foregroundStyle(Color.blue).annotation(position: .overlay) { Text("\(item.percentage, specifier: "%.0f")%").font(.caption).bold().foregroundColor(.white) } } }.padding() }
+                        }.padding().themeGlassStyle().padding()
+                        VStack {
+                            Text("Daily Intake Trend").font(.headline).foregroundColor(.secondary)
+                            if dailyTotals.isEmpty { Text("No data").foregroundColor(.secondary).padding() }
+                            else { Chart { ForEach(dailyTotals, id: \.date) { item in PointMark(x: .value("Date", item.date), y: .value("Calories", item.calories)).foregroundStyle(themeManager.currentTheme == .classicWhite ? Color.blue : Color(red: 1.0, green: 0.82, blue: 0.4)).symbolSize(100); LineMark(x: .value("Date", item.date), y: .value("Calories", item.calories)).foregroundStyle(themeManager.currentTheme == .classicWhite ? Color.blue.opacity(0.3) : Color(red: 1.0, green: 0.82, blue: 0.4).opacity(0.3)) } }.chartXAxis { AxisMarks(values: .stride(by: .day)) { _ in AxisGridLine(); AxisValueLabel(format: .dateTime.day()).foregroundStyle(Color.secondary) } }.chartYAxis { AxisMarks() { _ in AxisGridLine(); AxisValueLabel().foregroundStyle(Color.secondary) } }.padding() }
+                        }.padding().themeGlassStyle().padding()
+                    }.tabViewStyle(PageTabViewStyle(indexDisplayMode: .always)).frame(height: 300).padding(.bottom, 10)
+                    List {
+                        Section(header: Text("Tap a category").foregroundColor(.secondary)) {
+                            ForEach(categoryBreakdown, id: \.categoryItem.name) { item in Button(action: { selectedCategory = item.categoryItem }) { HStack { Text(item.categoryItem.emoji).font(.title2); Text(item.categoryItem.name).font(.body).foregroundColor(.primary); Spacer(); VStack(alignment: .trailing) { Text("\(item.calories, specifier: "%.0f") kcal").bold().foregroundColor(.primary); Text("\(item.percentage, specifier: "%.1f")%").font(.caption).foregroundColor(.secondary) }; Image(systemName: "chevron.right").foregroundColor(.secondary).font(.caption) } } }
+                        }.listRowBackground(Color.primary.opacity(0.05))
+                    }.listStyle(.insetGrouped).scrollContentBackground(.hidden)
+                }
+            }.navigationTitle("Intake Breakdown").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Close") { dismiss() }.foregroundColor(.primary) } }.sheet(item: $selectedCategory) { category in CategoryDetailView(categoryItem: category, logs: validMonthLogs.filter { $0.categoryItem.name == category.name }.sorted { $0.date > $1.date }) }
+        }
+    }
+}
+
+struct CategoryDetailView: View {
+    @Environment(\.dismiss) var dismiss
+    let categoryItem: CategoryItem, logs: [MealLog]
+    var body: some View {
+        NavigationView {
+            ZStack {
+                ThemeBackgroundView()
+                List {
+                    if logs.isEmpty { Text("No entries.").foregroundColor(.secondary).listRowBackground(Color.primary.opacity(0.05)) }
+                    else { ForEach(logs) { log in HStack { VStack(alignment: .leading) { Text(log.customName ?? log.categoryItem.name).font(.headline).foregroundColor(.primary); Text(log.date, style: .date).font(.caption).foregroundColor(.secondary) }; Spacer(); Text("\(log.calories, specifier: "%.0f") kcal").bold().foregroundColor(.primary) }.listRowBackground(Color.primary.opacity(0.05)) } }
+                }.scrollContentBackground(.hidden)
+            }.navigationTitle("\(categoryItem.emoji) \(categoryItem.name)").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() }.foregroundColor(.primary) } }
+        }
+    }
+}
