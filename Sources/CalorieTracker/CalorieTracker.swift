@@ -12,20 +12,22 @@ struct MyApp: App {
 }
 
 // MARK: - 0. THEME MANAGER & BACKGROUNDS
-enum AppTheme: String, CaseIterable {
+public enum AppTheme: String, CaseIterable {
     case classicWhite = "Classic White"
     case muzliDark = "Muzli Dark"
+
+    public var displayName: String { rawValue }
 }
 
-class ThemeManager: ObservableObject {
-    @Published var currentTheme: AppTheme {
+public class ThemeManager: ObservableObject {
+    @Published public var currentTheme: AppTheme {
         didSet { UserDefaults.standard.set(currentTheme.rawValue, forKey: "appTheme") }
     }
-    init() {
+    public init() {
         let savedTheme = UserDefaults.standard.string(forKey: "appTheme") ?? AppTheme.classicWhite.rawValue
         self.currentTheme = AppTheme(rawValue: savedTheme) ?? .classicWhite
     }
-    var colorScheme: ColorScheme { return currentTheme == .muzliDark ? .dark : .light }
+    public var colorScheme: ColorScheme { return currentTheme == .muzliDark ? .dark : .light }
 }
 
 struct ThemeBackgroundView: View {
@@ -56,32 +58,34 @@ struct ThemeGlass: ViewModifier {
 extension View { func themeGlassStyle(cornerRadius: CGFloat = 16) -> some View { self.modifier(ThemeGlass(cornerRadius: cornerRadius)) } }
 
 // MARK: - 1. DATA MODELS
-struct UserProfile: Codable {
-    var name: String = "My Profile"
-    var email: String = ""
-    var isEmailVerified: Bool = false
-    var lastCloudSync: Date? = nil
+public struct UserProfile: Codable {
+    public var name: String = "My Profile"
+    public var email: String = ""
+    public var isEmailVerified: Bool = false
+    public var lastCloudSync: Date? = nil
 
-    var weightKg: Double?
-    var baselineWeightKg: Double?
-    var heightCm: Double?
-    var age: Int?
-    var isMale: Bool = true
-    var rawBodyFatPercentage: Double?
-    var isSouthAsian: Bool = true
-    var targetBodyFatPercentage: Double = 14.0
-    var activityMultiplier: Double = 1.2
-    var weeklyLossRate: Double = 0.0075
+    public var weightKg: Double?
+    public var baselineWeightKg: Double?
+    public var heightCm: Double?
+    public var age: Int?
+    public var isMale: Bool = true
+    public var rawBodyFatPercentage: Double?
+    public var isSouthAsian: Bool = true
+    public var targetBodyFatPercentage: Double = 14.0
+    public var activityMultiplier: Double = 1.2
+    public var weeklyLossRate: Double = 0.0075
 
-    var correctedBodyFatPercentage: Double? {
+    public init() {}
+
+    public var correctedBodyFatPercentage: Double? {
         guard let rawBF = rawBodyFatPercentage else { return nil }
         return isSouthAsian ? (rawBF + 4.3) : rawBF
     }
-    var fatFreeMassKg: Double? {
+    public var fatFreeMassKg: Double? {
         guard let w = weightKg, let bf = correctedBodyFatPercentage else { return nil }
         return w * (1.0 - (bf / 100.0))
     }
-    var basalMetabolicRate: Double {
+    public var basalMetabolicRate: Double {
         let w = weightKg ?? 66.5
         let h = heightCm ?? 170.0
         let a = age ?? 23
@@ -93,7 +97,7 @@ struct UserProfile: Codable {
             return isMale ? (wF + hF - aF + 5.0) : (wF + hF - aF - 161.0)
         }
     }
-    var baseDailyTargetCalories: Double {
+    public var baseDailyTargetCalories: Double {
         let deficit = ((weightKg ?? 66.5) * weeklyLossRate * 7700.0) / 7.0
         let adaptation = max(0.0, (baselineWeightKg ?? 0) - (weightKg ?? 0)) * 121.0
         let target = (basalMetabolicRate * activityMultiplier) - deficit - adaptation
@@ -101,64 +105,109 @@ struct UserProfile: Codable {
     }
 }
 
-struct CategoryItem: Identifiable, Hashable, Codable {
-    var id = UUID()
-    var name: String
-    var emoji: String
+public struct CategoryItem: Identifiable, Hashable, Codable {
+    public var id = UUID()
+    public var name: String
+    public var emoji: String
+
+    public init(id: UUID = UUID(), name: String, emoji: String) {
+        self.id = id
+        self.name = name
+        self.emoji = emoji
+    }
 }
 
-struct MealLog: Identifiable, Equatable, Codable {
-    var id = UUID()
-    var date: Date
-    var categoryItem: CategoryItem // Fixed logic flaw: now supports custom categories natively
-    var customName: String?
-    var calories: Double
-    var weightGrams: Double?
-    var cuisineType: String?
-    var proteinGrams: Double?
-    var carbsGrams: Double?
-    var fatGrams: Double?
-    var fiberGrams: Double?
-    var isSavedTemplate: Bool?
+public struct MealLog: Identifiable, Equatable, Codable {
+    public var id = UUID()
+    public var date: Date
+    public var categoryItem: CategoryItem
+    public var customName: String?
+    public var calories: Double
+    public var weightGrams: Double?
+    public var cuisineType: String?
+    public var proteinGrams: Double?
+    public var carbsGrams: Double?
+    public var fatGrams: Double?
+    public var fiberGrams: Double?
+    public var isSavedTemplate: Bool?
+
+    public init(date: Date, categoryItem: CategoryItem, customName: String? = nil, calories: Double, weightGrams: Double? = nil, cuisineType: String? = nil, proteinGrams: Double? = nil, carbsGrams: Double? = nil, fatGrams: Double? = nil, fiberGrams: Double? = nil, isSavedTemplate: Bool? = nil) {
+        self.date = date
+        self.categoryItem = categoryItem
+        self.customName = customName
+        self.calories = calories
+        self.weightGrams = weightGrams
+        self.cuisineType = cuisineType
+        self.proteinGrams = proteinGrams
+        self.carbsGrams = carbsGrams
+        self.fatGrams = fatGrams
+        self.fiberGrams = fiberGrams
+        self.isSavedTemplate = isSavedTemplate
+    }
 }
 
-struct WorkoutLog: Identifiable, Equatable, Codable {
-    let id = UUID()
-    var date: Date
-    var workoutType: String
-    var caloriesBurned: Double
+public struct WorkoutLog: Identifiable, Equatable, Codable {
+    public let id = UUID()
+    public var date: Date
+    public var workoutType: String
+    public var caloriesBurned: Double
+
+    public init(date: Date, workoutType: String, caloriesBurned: Double) {
+        self.date = date
+        self.workoutType = workoutType
+        self.caloriesBurned = caloriesBurned
+    }
 }
 
-struct DailyEntry: Identifiable {
-    let id = UUID()
-    var date: Date
-    var isWorkout: Bool
-    var title: String
-    var subtitle: String?
-    var calories: Double
-    var emoji: String
+public struct DailyEntry: Identifiable {
+    public let id = UUID()
+    public var date: Date
+    public var isWorkout: Bool
+    public var title: String
+    public var subtitle: String?
+    public var calories: Double
+    public var emoji: String
+
+    public init(date: Date, isWorkout: Bool, title: String, subtitle: String? = nil, calories: Double, emoji: String) {
+        self.date = date
+        self.isWorkout = isWorkout
+        self.title = title
+        self.subtitle = subtitle
+        self.calories = calories
+        self.emoji = emoji
+    }
 }
 
-struct AppNotification: Identifiable, Codable {
-    let id = UUID()
-    var icon: String
-    var colorR: Double
-    var colorG: Double
-    var colorB: Double
-    var title: String
-    var text: String
-    var date: Date
+public struct AppNotification: Identifiable, Codable {
+    public let id = UUID()
+    public var icon: String
+    public var colorR: Double
+    public var colorG: Double
+    public var colorB: Double
+    public var title: String
+    public var text: String
+    public var date: Date
+
+    public init(icon: String, colorR: Double, colorG: Double, colorB: Double, title: String, text: String, date: Date) {
+        self.icon = icon
+        self.colorR = colorR
+        self.colorG = colorG
+        self.colorB = colorB
+        self.title = title
+        self.text = text
+        self.date = date
+    }
 }
 
 // MARK: - 2. HEALTH MANAGER (Logic Layer)
-class HealthManager: ObservableObject {
-    @Published var isAuthorized = false
-    @Published var isMissingVitalData = false
-    @Published var profile = UserProfile()
-    @Published var workoutLogs: [WorkoutLog] = []
-    @Published var notifications: [AppNotification] = []
+public class HealthManager: ObservableObject {
+    @Published public var isAuthorized = false
+    @Published public var isMissingVitalData = false
+    @Published public var profile = UserProfile()
+    @Published public var workoutLogs: [WorkoutLog] = []
+    @Published public var notifications: [AppNotification] = []
 
-    @Published var customCategories: [CategoryItem] = [
+    @Published public var customCategories: [CategoryItem] = [
         CategoryItem(name: "Breakfast", emoji: "🍞"),
         CategoryItem(name: "Lunch", emoji: "🥗"),
         CategoryItem(name: "Dinner", emoji: "🥩"),
@@ -166,14 +215,16 @@ class HealthManager: ObservableObject {
         CategoryItem(name: "Supplements", emoji: "🥤")
     ]
 
-    func requestAuthorization() {
+    public init() {}
+
+    public func requestAuthorization() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             self.isAuthorized = true
             self.fetchHealthData()
         }
     }
 
-    func fetchHealthData() {
+    public func fetchHealthData() {
         self.workoutLogs = [
             WorkoutLog(date: Date(), workoutType: "Outdoor Run", caloriesBurned: 450.0)
         ]
@@ -182,7 +233,7 @@ class HealthManager: ObservableObject {
         }
     }
 
-    func generateLocalWeeklyReport(from allLogs: [MealLog]) {
+    public func generateLocalWeeklyReport(from allLogs: [MealLog]) {
         let calendar = Calendar.current
         let today = Date()
         guard let startOfWeek = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: today)),
@@ -211,12 +262,12 @@ class HealthManager: ObservableObject {
         }
     }
 
-    func fetchMealEstimate(name: String, weight: Double, cuisine: String) async -> Double {
+    public func fetchMealEstimate(name: String, weight: Double, cuisine: String) async -> Double {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         return weight * 2.4
     }
 
-    func validateMacros(protein: Double, carbs: Double, fiber: Double, fat: Double) async -> Double {
+    public func validateMacros(protein: Double, carbs: Double, fiber: Double, fat: Double) async -> Double {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         return (protein * 4.0) + (max(0, carbs - fiber) * 4.0) + (fat * 9.0)
     }
